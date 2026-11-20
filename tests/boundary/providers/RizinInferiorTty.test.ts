@@ -1,29 +1,24 @@
 import { execFileSync, spawn as spawnChild } from "node:child_process";
-import {
-  chmod,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, readFile, realpath, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import { spawn } from "@lydell/node-pty";
 import { afterEach, expect, it, vi } from "vitest";
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 import {
   assertRizinProcessStartTimeStable,
   RizinDebugSessionManager,
 } from "../../../src/rizin/RizinDebugSessionManager.js";
 import { evidenceSchema } from "../../../src/domain/evidence.js";
-import { TOOL_EFFECTS } from "../../../src/contracts/toolEffects.js";
+import { RIZIN_DEBUG_TOOL_CONTRACTS } from "../../../src/contracts/rizinDebugToolContracts.js";
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import {
   createRizinTestManager,
   rizinTestInferiorTty,
 } from "./RizinTestInferiorTty.js";
 import { createInjectedProcess } from "./RizinDebugSessionCoverage.fixtures.js";
+import { waitForTestPidFile } from "../../support/process/pidFile.js";
 
 let terminal: ReturnType<typeof spawn> | undefined;
 let manager: RizinDebugSessionManager | undefined;
@@ -83,8 +78,6 @@ afterEach(async () => {
     }
   }
   inferiorPid = undefined;
-  if (testDirectory !== undefined)
-    await rm(testDirectory, { recursive: true, force: true });
   testDirectory = undefined;
 });
 
@@ -150,7 +143,11 @@ it.skipIf(process.platform === "win32")(
 );
 
 it("declares that Rizin close can resume target code and mutate target state", () => {
-  expect(TOOL_EFFECTS.close_rizin_debug_session).toMatchObject({
+  expect(
+    RIZIN_DEBUG_TOOL_CONTRACTS.find(
+      ({ name }) => name === "close_rizin_debug_session",
+    )?.effects,
+  ).toMatchObject({
     mutatesTarget: true,
     executesForeignCode: true,
   });
@@ -190,7 +187,7 @@ it.skipIf(process.platform !== "linux").each([
   "validates Rizin `olj` close response: $name",
   async ({ response, closeSucceeds }) => {
     const tty = await rizinTestInferiorTty();
-    testDirectory = await mkdtemp(join(tmpdir(), "rea-rizin-olj-"));
+    testDirectory = await createTestTempDirectory("rea-rizin-olj-");
     const provider = join(testDirectory, "fake-rizin.cjs");
     await writeFile(
       provider,
@@ -303,7 +300,6 @@ it.skipIf(process.platform !== "linux")(
     });
     await expectCloseRejectedAndReleased(sessionId);
   },
-  4_000,
 );
 
 it("rejects changed or missing Rizin inferior identity during detach", () => {
@@ -330,7 +326,11 @@ it.skipIf(process.platform !== "linux")(
           } catch {
             // This fixture verifies the manager's fail-closed read path only.
           }
-          return { status: "incomplete", reason: "unreachable" };
+          return {
+            status: "incomplete",
+            code: "stop-failed",
+            reason: "unreachable",
+          };
         },
       },
     );
@@ -363,6 +363,7 @@ it.skipIf(process.platform !== "linux")(
   async () => {
     const sessionId = await startFakeInferiorSession({
       overflowPxCommand: true,
+      withholdCleanupSynchronization: true,
       maxCommandOutputBytes: 1_024,
     });
     let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -400,8 +401,10 @@ it.skipIf(process.platform !== "linux")(
     expect(evidence.normalized_result).toMatchObject({
       output_truncated: true,
     });
-    expect(evidence.limitations.join(" ")).toContain(
-      "The owned debugger session remains retained because cleanup could not be verified",
+    expect(evidence.limitations).toContainEqual(
+      expect.stringMatching(
+        /debugger session.*retained.*cleanup could not be verified/iu,
+      ),
     );
     expect(manager!.status(sessionId)?.state).toBe("closed");
   },
@@ -436,7 +439,7 @@ it.skipIf(
       });
     });
     const tty = await realpath(ttyPath);
-    testDirectory = await mkdtemp(join(tmpdir(), "rea-rizin-tty-"));
+    testDirectory = await createTestTempDirectory("rea-rizin-tty-");
     const wrapper = join(testDirectory, "rizin-with-long-lived-inferior.sh");
     const pidPath = join(testDirectory, "target.pid");
     const releasePath = join(testDirectory, "emit-output");
@@ -463,18 +466,7 @@ it.skipIf(
     );
     const closed = await closing;
     expect(closed.ok, closed.ok ? "" : closed.error.message).toBe(true);
-    const deadline = Date.now() + 5_000;
-    let pidText = "";
-    while (Date.now() < deadline) {
-      try {
-        pidText = await readFile(pidPath, "utf8");
-        break;
-      } catch {
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-      }
-    }
-    inferiorPid = Number(pidText);
-    expect(Number.isSafeInteger(inferiorPid) && inferiorPid > 0).toBe(true);
+    inferiorPid = await waitForTestPidFile(pidPath, 5_000);
     expect(() => process.kill(inferiorPid!, 0)).not.toThrow();
     await writeFile(releasePath, "release after close");
     const outputDeadline = Date.now() + 3_000;
@@ -520,12 +512,13 @@ async function startFakeInferiorSession(
     readonly truncateOlj?: boolean;
     readonly truncateCleanupFrame?: boolean;
     readonly overflowPxCommand?: boolean;
+    readonly withholdCleanupSynchronization?: boolean;
     readonly startupWatchdogMs?: number;
     readonly maxCommandOutputBytes?: number;
   } = {},
 ): Promise<string> {
   const tty = await realpath(await rizinTestInferiorTty());
-  testDirectory = await mkdtemp(join(tmpdir(), "rea-rizin-protocol-"));
+  testDirectory = await createTestTempDirectory("rea-rizin-protocol-");
   const targetPath = join(testDirectory, "inferior.mjs");
   const pidPath = join(testDirectory, "target.pid");
   const provider = join(testDirectory, "fake-rizin.cjs");
@@ -547,6 +540,7 @@ const exitKills = ${JSON.stringify(options.exitKills ?? "false")};
 const truncateOlj = ${JSON.stringify(options.truncateOlj ?? false)};
 const truncateCleanupFrame = ${JSON.stringify(options.truncateCleanupFrame ?? false)};
 const overflowPxCommand = ${JSON.stringify(options.overflowPxCommand ?? false)};
+const withholdCleanupSynchronization = ${JSON.stringify(options.withholdCleanupSynchronization ?? false)};
 let oljCalls = 0;
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -563,6 +557,7 @@ process.stdin.on("data", (chunk) => {
     }
     else if (overflowPxCommand && line === "px") process.stdout.write("x".repeat(2_048) + "\\0");
     else if (line === "e dbg.exitkills") process.stdout.write(exitKills + "\\0");
+    else if (withholdCleanupSynchronization && line.startsWith("!echo __REA_CLEANUP_SYNC_")) {}
     else if (line.startsWith("!echo ")) process.stdout.write((truncateCleanupFrame ? "x".repeat(2_048) : "") + line.slice(6) + "\\0");
   }
 });
@@ -571,7 +566,17 @@ process.stdin.on("data", (chunk) => {
   await chmod(provider, 0o700);
   let providerStderr = "";
   manager = new RizinDebugSessionManager(
-    { ...process.env, REA_RIZIN_COMMAND: provider },
+    {
+      PATH: process.env.PATH,
+      ...(options.maxCommandOutputBytes === undefined
+        ? {}
+        : {
+            REA_DEBUGGER_MAX_COMMAND_OUTPUT_BYTES: String(
+              options.maxCommandOutputBytes,
+            ),
+          }),
+      REA_RIZIN_COMMAND: provider,
+    },
     {
       spawnProcess: async (spawnOptions) => {
         const launched = await spawnOwnedProviderProcess(spawnOptions);
@@ -597,9 +602,6 @@ process.stdin.on("data", (chunk) => {
         });
         return launched;
       },
-      ...(options.maxCommandOutputBytes === undefined
-        ? {}
-        : { maxCommandOutputBytes: options.maxCommandOutputBytes }),
     },
   );
   const started = await manager.start({
@@ -612,20 +614,7 @@ process.stdin.on("data", (chunk) => {
   ).toBe(true);
   if (!started.ok) throw started.error;
   if (launchTarget) {
-    let pidText: string | undefined;
-    const deadline = Date.now() + 2_000;
-    while (pidText === undefined && Date.now() < deadline) {
-      try {
-        pidText = await readFile(pidPath, "utf8");
-      } catch {
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
-      }
-    }
-    const parsedInferiorPid =
-      pidText === undefined ? Number.NaN : Number(pidText);
-    if (!Number.isSafeInteger(parsedInferiorPid) || parsedInferiorPid <= 0)
-      throw new Error("The test inferior did not publish a valid PID.");
-    inferiorPid = parsedInferiorPid;
+    inferiorPid = await waitForTestPidFile(pidPath, 2_000);
   }
   return started.value.session_id;
 }

@@ -1,8 +1,13 @@
-import { resolve } from "node:path";
+import { mkdir, symlink } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { createTestTempDirectory } from "../tests/fixtures/temporaryDirectory.js";
 
-import { resolveCliJsonPaths } from "./cliJsonInput.js";
+import {
+  cliJsonCallerPathSchema,
+  resolveCliJsonPaths,
+} from "./cli/cliJsonInput.js";
 import { electronActiveObservationInputSchema } from "./domain/javascript/electronActiveObservation.js";
 
 const paths = [
@@ -12,6 +17,15 @@ const paths = [
 ] as const;
 
 describe("CLI JSON path normalization", () => {
+  it.each([" ", "\t\r\n", "\u00a0", "\u2003", "\ufeff"])(
+    "refuses blank caller path %j before normalization",
+    (path) => {
+      expect(cliJsonCallerPathSchema.safeParse(path).success).toBe(false);
+      expect(resolveCliJsonPaths({ executable_path: path }, paths)).toEqual({
+        executable_path: path,
+      });
+    },
+  );
   it.each([
     ["executable_path", ""],
     ["executable_path", " \t "],
@@ -57,17 +71,62 @@ describe("CLI JSON path normalization", () => {
     expect(input.browser.executable_path).toBe(" browser ");
   });
 
+  it.skipIf(process.platform === "win32")(
+    "keeps POSIX symlink-parent traversal for each selected JSON path",
+    async () => {
+      const root = await createTestTempDirectory("rea-json-caller-path-");
+      const originalCwd = process.cwd();
+      try {
+        await mkdir(join(root, "real/inner"), { recursive: true });
+        await symlink(join(root, "real/inner"), join(root, "link"));
+        process.chdir(root);
+        const electronInput = {
+          executable_path: "link/../tool",
+          application_path: "link/../app",
+          application_root: "link/../root",
+        };
+        const normalizedElectron = resolveCliJsonPaths(electronInput, paths);
+        expect(normalizedElectron).toEqual({
+          executable_path: `${root}/link/../tool`,
+          application_path: `${root}/link/../app`,
+          application_root: `${root}/link/../root`,
+        });
+        expect(electronInput.executable_path).toBe("link/../tool");
+        expect(
+          electronActiveObservationInputSchema.safeParse(normalizedElectron)
+            .success,
+        ).toBe(true);
+        const browserInput = {
+          browser: { executable_path: "link/../browser", label: "keep" },
+        };
+        expect(
+          resolveCliJsonPaths(browserInput, [["browser", "executable_path"]]),
+        ).toEqual({
+          browser: {
+            executable_path: `${root}/link/../browser`,
+            label: "keep",
+          },
+        });
+        expect(browserInput.browser.executable_path).toBe("link/../browser");
+      } finally {
+        process.chdir(originalCwd);
+      }
+    },
+  );
+
   it.each([
     "file:///opt/electron",
     "FILE:electron",
     "https://example.test/app",
   ])("keeps URL %j distinguishable from a local path", (value) => {
-    const input = {
+    const expected = {
       executable_path: value,
       application_path: resolve("/synthetic/app"),
     };
+    const input = { ...expected };
     const normalized = resolveCliJsonPaths(input, paths);
-    expect(normalized).toEqual(input);
+    expect(normalized).toEqual(expected);
+    expect(input).toEqual(expected);
     const parsed = electronActiveObservationInputSchema.safeParse(normalized);
     expect(parsed.success).toBe(false);
     if (parsed.success) throw new Error("Expected URL path rejection");
@@ -75,7 +134,7 @@ describe("CLI JSON path normalization", () => {
       expect.objectContaining({
         path: ["executable_path"],
         code: "invalid_format",
-        message: expect.stringContaining("absolute local filesystem path"),
+        format: "regex",
       }),
     ]);
   });

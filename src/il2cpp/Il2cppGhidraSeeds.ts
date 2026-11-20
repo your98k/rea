@@ -1,19 +1,54 @@
 import {
-  MAX_GHIDRA_SEED_BYTES,
-  MAX_GHIDRA_SEED_ENTRIES,
-  MAX_GHIDRA_SEED_NAME_LENGTH,
-} from "../ghidra/GhidraAnalysisSeeds.js";
-import {
   AnalysisInputError,
   AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
+import {
+  fixedAllowanceOptions,
+  type FixedAllowance,
+} from "../domain/fixedAllowanceRemediation.js";
 const OPERATION = "inspect_il2cpp_metadata";
-const capacity = (message: string) =>
-  new AnalysisResourceConstraintError(OPERATION, "capacity", message, {
-    maximum_seed_bytes: MAX_GHIDRA_SEED_BYTES,
-    maximum_seed_name_characters: MAX_GHIDRA_SEED_NAME_LENGTH,
-  });
+/** Each Ghidra seed admission ceiling, with the value that refuses a seed. */
+const SEED_ALLOWANCES = {
+  name: {
+    name: "The IL2CPP Ghidra seed-name allowance",
+    kind: "count",
+    limit: MAX_GHIDRA_SEED_NAME_LENGTH,
+    unit: "characters",
+  },
+  file: {
+    name: "The IL2CPP Ghidra seed-file allowance",
+    kind: "bytes",
+    limit: MAX_GHIDRA_SEED_BYTES,
+    unit: "bytes",
+  },
+  entry: {
+    name: "The IL2CPP Ghidra seed-entry allowance",
+    kind: "count",
+    limit: MAX_GHIDRA_SEED_ENTRIES,
+    unit: "entries",
+  },
+} as const satisfies Record<string, FixedAllowance>;
+
+const capacity = (message: string, allowance: keyof typeof SEED_ALLOWANCES) => {
+  const { name, kind, limit, unit } = SEED_ALLOWANCES[allowance];
+  return new AnalysisResourceConstraintError(
+    OPERATION,
+    "capacity",
+    message,
+    {
+      maximum_seed_bytes: MAX_GHIDRA_SEED_BYTES,
+      maximum_seed_entries: MAX_GHIDRA_SEED_ENTRIES,
+      maximum_seed_name_characters: MAX_GHIDRA_SEED_NAME_LENGTH,
+    },
+    fixedAllowanceOptions(name, kind, { limit, unit }),
+  );
+};
 import type { Il2cppMetadata } from "../domain/il2cpp/il2cppMetadata.js";
+import {
+  MAX_GHIDRA_SEED_BYTES,
+  MAX_GHIDRA_SEED_ENTRIES,
+  MAX_GHIDRA_SEED_NAME_LENGTH,
+} from "../domain/native/ghidraSeedFile.js";
 
 /** A linked metadata report reduced to Ghidra function seeds. */
 export interface Il2cppGhidraSeeds {
@@ -32,6 +67,10 @@ export interface Il2cppGhidraSeeds {
   readonly without_address: number;
   readonly no_body: number;
   readonly unknown: number;
+  /** Generic instance rows seeded or folded; null when the report did not link them. */
+  readonly generic_instances: number | null;
+  /** Generic instance rows left unseeded (no code or no name); null as above. */
+  readonly generic_without_seed: number | null;
 }
 
 /**
@@ -72,11 +111,17 @@ const typeName = (report: Il2cppMetadata, index: number): string => {
       ]);
     length += type.name.length + 1;
     if (length > MAX_GHIDRA_SEED_NAME_LENGTH)
-      throw capacity("Qualified seed type name exceeds the Ghidra name limit.");
+      throw capacity(
+        "Qualified seed type name exceeds the Ghidra name limit.",
+        "name",
+      );
     parts.unshift(type.name);
     namespace = type.namespace;
     if (length + namespace.length > MAX_GHIDRA_SEED_NAME_LENGTH)
-      throw capacity("Qualified seed type name exceeds the Ghidra name limit.");
+      throw capacity(
+        "Qualified seed type name exceeds the Ghidra name limit.",
+        "name",
+      );
     at = type.declaring_type;
   }
   return namespace === "" ? parts.join(".") : `${namespace}.${parts.join(".")}`;
@@ -112,21 +157,15 @@ export const il2cppGhidraSeeds = (
   const typeNames = new Map<number, string>();
   const reserve = (length: number) => {
     if (length > MAX_GHIDRA_SEED_BYTES - bytes)
-      throw capacity("Seed file exceeds Ghidra byte admission.");
+      throw capacity("Seed file exceeds Ghidra byte admission.", "file");
     bytes += length;
   };
   const emit = (text: string) => {
     reserve(Buffer.byteLength(text));
     lines.push(text);
   };
-  report.methods.forEach((method, index) => {
-    const rva = report.method_addresses[index]?.rva ?? null;
-    if (rva === null) {
-      withoutAddress++;
-      if (report.method_addresses[index]?.state === "no-body") noBody++;
-      else unknown++;
-      return;
-    }
+  /** Seed `name` at base + rva, or fold it under the name already there. */
+  const seed = (rva: string, raw: string, path: (string | number)[]) => {
     const address = base + BigInt(rva);
     if (address < 0n || address > 0xffffffffffffffffn)
       throw new AnalysisInputError(OPERATION, undefined, [
@@ -136,20 +175,16 @@ export const il2cppGhidraSeeds = (
           message: "Rebased seed address exceeds 64 bits.",
         },
       ]);
-    let ownerName = typeNames.get(method.declaring_type);
-    if (ownerName === undefined) {
-      ownerName = typeName(report, method.declaring_type);
-      typeNames.set(method.declaring_type, ownerName);
-    }
-    if (ownerName.length + 2 + method.name.length > MAX_GHIDRA_SEED_NAME_LENGTH)
+    if (raw.length > MAX_GHIDRA_SEED_NAME_LENGTH)
       throw capacity(
         "Qualified method seed name exceeds Ghidra character admission.",
+        "name",
       );
-    const name = `${ownerName}$$${method.name}`.replace(/\s/gu, "_");
+    const name = raw.replace(/\s/gu, "_");
     if (name.includes("\0"))
       throw new AnalysisInputError(OPERATION, undefined, [
         {
-          path: ["methods", index, "name"],
+          path,
           reason: "invalid_format",
           message: "Seed names cannot contain NUL.",
         },
@@ -169,8 +204,43 @@ export const il2cppGhidraSeeds = (
     }
     seeded.set(address, { kept: name, also: [] });
     if (seeded.size > MAX_GHIDRA_SEED_ENTRIES)
-      throw capacity("Seed function count exceeds Ghidra entry admission.");
+      throw capacity(
+        "Seed function count exceeds Ghidra entry admission.",
+        "entry",
+      );
     emit(`0x${address.toString(16)}\tfunction\t${name}\n`);
+  };
+  report.methods.forEach((method, index) => {
+    const rva = report.method_addresses[index]?.rva ?? null;
+    if (rva === null) {
+      withoutAddress++;
+      if (report.method_addresses[index]?.state === "no-body") noBody++;
+      else unknown++;
+      return;
+    }
+    let ownerName = typeNames.get(method.declaring_type);
+    if (ownerName === undefined) {
+      ownerName = typeName(report, method.declaring_type);
+      typeNames.set(method.declaring_type, ownerName);
+    }
+    if (ownerName.length + 2 + method.name.length > MAX_GHIDRA_SEED_NAME_LENGTH)
+      throw capacity(
+        "Qualified method seed name exceeds Ghidra character admission.",
+        "name",
+      );
+    seed(rva, `${ownerName}$$${method.name}`, ["methods", index, "name"]);
+  });
+  // Generic instances follow the definitions, so an instance sharing a
+  // definition's code is folded under the definition's name.
+  let genericInstances = 0,
+    genericWithoutSeed = 0;
+  report.generic_method_instances?.forEach((row, index) => {
+    if (row.rva === null || row.name === null) {
+      genericWithoutSeed++;
+      return;
+    }
+    genericInstances++;
+    seed(row.rva, row.name, ["generic_method_instances", index, "name"]);
   });
   const foldedGroups = [...seeded]
     .filter(([, group]) => group.also.length > 0)
@@ -195,5 +265,9 @@ export const il2cppGhidraSeeds = (
     without_address: withoutAddress,
     no_body: noBody,
     unknown,
+    generic_instances:
+      report.generic_method_instances == null ? null : genericInstances,
+    generic_without_seed:
+      report.generic_method_instances == null ? null : genericWithoutSeed,
   };
 };

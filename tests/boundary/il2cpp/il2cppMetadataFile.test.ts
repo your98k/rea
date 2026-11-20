@@ -6,9 +6,12 @@ import { describe, expect, it } from "vitest";
 import {
   il2cppIndexWidth,
   il2cppMetadataRecordBytes,
-  readIl2cppMetadata,
   readIl2cppMetadataSteps,
 } from "../../../src/il2cpp/Il2cppMetadataFile.js";
+import {
+  readIl2cppMetadata,
+  readIl2cppMetadataForLinking,
+} from "../../fixtures/il2cpp/readers.js";
 import {
   createIl2cppMetadataFixture,
   FIXTURE_IMAGES,
@@ -24,9 +27,14 @@ import {
   type Il2cppMetadataFixture,
 } from "../../fixtures/il2cpp/metadata.js";
 
-const failure = (bytes: Buffer) => {
+const failure = (
+  bytes: Buffer,
+  reader:
+    | typeof readIl2cppMetadata
+    | typeof readIl2cppMetadataForLinking = readIl2cppMetadata,
+) => {
   try {
-    readIl2cppMetadata(bytes);
+    reader(bytes);
   } catch (cause: unknown) {
     if (cause instanceof Il2cppMetadataFormatFailure) return cause;
     throw cause;
@@ -37,7 +45,7 @@ const failure = (bytes: Buffer) => {
 const rejects = (
   bytes: Buffer,
   reason: Il2cppMetadataFailureReason,
-  kind: "unsupported" | "corrupt" = "corrupt",
+  kind: "unsupported" | "truncated" | "malformed" = "malformed",
 ) => {
   const rejected = failure(bytes);
   expect(rejected.reason).toBe(reason);
@@ -124,18 +132,28 @@ describe("IL2CPP global-metadata version 39", () => {
     },
   );
 
-  it("recovers the TypeIndex width from type records without interfaceOffsets", () => {
-    const fixture = createIl2cppMetadataFixture({
-      typeIndexWidth: 2,
-      interfaceOffsets: false,
-    });
-    const decoded = readIl2cppMetadata(fixture.bytes);
-    expect(decoded.index_widths.type).toBe(2);
-    expect(decoded.index_widths.type_width_source).toBe(
-      "type-definition-record",
-    );
-    expect(decoded.methods).toEqual(FIXTURE_METHODS);
-  });
+  it.each([
+    [0, 1],
+    [300, 2],
+  ] as const)(
+    "recovers the TypeIndex width from type records with %i generic containers and no interface offsets",
+    (genericContainers, genericContainerWidth) => {
+      const fixture = createIl2cppMetadataFixture({
+        typeIndexWidth: 2,
+        interfaceOffsets: false,
+        wide: { fillerTypes: 0, genericContainers, parameters: 0 },
+      });
+      const decoded = readIl2cppMetadata(fixture.bytes);
+      expect(decoded.index_widths.generic_container).toBe(
+        genericContainerWidth,
+      );
+      expect(decoded.index_widths.type).toBe(2);
+      expect(decoded.index_widths.type_width_source).toBe(
+        "type-definition-record",
+      );
+      expect(decoded.methods).toEqual(FIXTURE_METHODS);
+    },
+  );
 
   it("accepts empty sections that share an offset with occupied sections and padding gaps", () => {
     const bytes = mutated((fixture, target) => {
@@ -161,7 +179,8 @@ describe("rejected IL2CPP global-metadata", () => {
       "unrecognized-magic",
       "unsupported",
     );
-    rejects(Buffer.alloc(4), "unrecognized-magic", "unsupported");
+    for (const length of [4, 5, 6, 7])
+      rejects(Buffer.alloc(length), "unrecognized-magic", "unsupported");
     rejects(
       mutated((_, bytes) => bytes.writeInt32LE(30, 4)),
       "unsupported-version",
@@ -169,10 +188,45 @@ describe("rejected IL2CPP global-metadata", () => {
     );
   });
 
+  it("retains the decoder's signed interpretation of a complete high-bit version", () => {
+    const bytes = Buffer.alloc(8);
+    bytes.writeUInt32LE(0xfab11baf, 0);
+    bytes.writeUInt32LE(0xffffffff, 4);
+    const rejected = failure(bytes);
+    expect(rejected.reason).toBe("unsupported-version");
+    expect(rejected.kind).toBe("unsupported");
+    expect(rejected.message).toContain("metadata version -1 is not supported");
+  });
+
+  it.each([4, 5, 6, 7])(
+    "retains recognized magic and reports a %i-byte version prefix as truncated",
+    (length) => {
+      const bytes = Buffer.alloc(length);
+      bytes.writeUInt32LE(0xfab11baf, 0);
+      const rejected = failure(bytes);
+      expect(rejected.reason).toBe("truncated-header");
+      expect(rejected.kind).toBe("truncated");
+      expect(rejected.message).toContain(
+        "fewer than the 8-byte magic/version prefix",
+      );
+      expect(rejected.message).toContain("metadata version is unknown");
+    },
+  );
+
+  it("uses the same truncated-prefix classification before native linking", () => {
+    const bytes = Buffer.alloc(7);
+    bytes.writeUInt32LE(0xfab11baf, 0);
+    const rejected = failure(bytes, readIl2cppMetadataForLinking);
+    expect(rejected.reason).toBe("truncated-header");
+    expect(rejected.kind).toBe("truncated");
+    expect(rejected.message).toContain("metadata version is unknown");
+  });
+
   it("rejects a truncated header and an unexpected header size", () => {
     rejects(
       createIl2cppMetadataFixture().bytes.subarray(0, 200),
       "truncated-header",
+      "truncated",
     );
     rejects(
       mutated((fixture, bytes) =>
@@ -220,13 +274,6 @@ describe("rejected IL2CPP global-metadata", () => {
       ),
       "record-size-mismatch",
     );
-    // 300 generic containers widen GenericContainerIndex to two bytes.
-    rejects(
-      mutated((fixture, bytes) =>
-        bytes.writeInt32LE(300, fixture.header("genericContainers", "count")),
-      ),
-      "record-size-mismatch",
-    );
     rejects(
       mutated((fixture, bytes) =>
         bytes.writeInt32LE(2, fixture.header("nestedTypes", "count")),
@@ -248,6 +295,142 @@ describe("rejected IL2CPP global-metadata", () => {
     );
   });
 });
+
+describe("IL2CPP generic-container linking facts", () => {
+  it.each([31, 39] as const)(
+    "retains type argument counts and version %i container admission",
+    (version) => {
+      const fixture = createIl2cppMetadataFixture({
+        version,
+        genericOwners: true,
+      });
+      const { link } = readIl2cppMetadataForLinking(fixture.bytes);
+      expect(link.genericTypeArgumentCounts[3]).toBe(1);
+      expect(link.methodGenericContainer(4)).toBe(2);
+      expect(link.typeGenericContainer(3)).toBe(version === 39 ? undefined : 0);
+      expect(link.genericContainer(0)).toEqual(
+        version === 39 ? undefined : { count: 1, parameterStart: 0 },
+      );
+      expect(link.typeGenericContainer(-1)).toBeUndefined();
+      expect(link.genericContainer(-1)).toBeUndefined();
+    },
+  );
+
+  it.each([31, 39] as const)(
+    "keeps negative argument counts admissible to inventory but refuses version %i linking",
+    (version) => {
+      const bytes = createIl2cppMetadataFixture({
+        version,
+        genericTypeArgumentCounts: { 3: -1 },
+      }).bytes;
+      expect(readIl2cppMetadata(bytes).types[3]?.name).toBe("Größe");
+      const rejected = failure(bytes, readIl2cppMetadataForLinking);
+      expect(rejected.reason).toBe("index-out-of-range");
+      expect(rejected.message).toContain("negative argument count -1");
+    },
+  );
+});
+
+describe("IL2CPP generic-container extents", () => {
+  it("checks generic-container count against its fixed 16-byte records before resolving widths", () => {
+    for (const [interfaceOffsets, count] of [
+      [true, 1],
+      [true, 300],
+      [false, 300],
+    ] as const) {
+      const bytes = mutated(
+        (fixture, bytes) =>
+          bytes.writeInt32LE(
+            count,
+            fixture.header("genericContainers", "count"),
+          ),
+        createIl2cppMetadataFixture({ interfaceOffsets }),
+      );
+      for (const reader of [readIl2cppMetadata, readIl2cppMetadataForLinking]) {
+        const rejected = failure(bytes, reader);
+        expect(rejected.reason).toBe("record-size-mismatch");
+        expect(rejected.message).toContain("genericContainers");
+      }
+    }
+    const oneRecord = createIl2cppMetadataFixture({
+      wide: { fillerTypes: 0, genericContainers: 1, parameters: 0 },
+    });
+    // A positive count with a partial record.
+    rejects(
+      mutated(
+        (fixture, bytes) =>
+          bytes.writeInt32LE(1, fixture.header("genericContainers", "size")),
+        oneRecord,
+      ),
+      "record-size-mismatch",
+    );
+    // Bytes without a corresponding record.
+    rejects(
+      mutated(
+        (fixture, bytes) =>
+          bytes.writeInt32LE(0, fixture.header("genericContainers", "count")),
+        oneRecord,
+      ),
+      "record-size-mismatch",
+    );
+  });
+
+  it("retains width selection for empty and complete generic-container records", () => {
+    const empty = readIl2cppMetadata(createIl2cppMetadataFixture().bytes);
+    expect(empty.index_widths.generic_container).toBe(1);
+
+    const one = readIl2cppMetadata(
+      createIl2cppMetadataFixture({
+        wide: { fillerTypes: 0, genericContainers: 1, parameters: 0 },
+      }).bytes,
+    );
+    expect(one.index_widths.generic_container).toBe(1);
+
+    const wide = readIl2cppMetadata(
+      createIl2cppMetadataFixture({
+        wide: { fillerTypes: 0, genericContainers: 300, parameters: 0 },
+      }).bytes,
+    );
+    expect(wide.index_widths.generic_container).toBe(2);
+  });
+});
+
+it("checks backing parameter records before widening method parameter indices", () => {
+  const count = 300;
+  const unbacked = mutated((fixture, bytes) =>
+    bytes.writeInt32LE(count, fixture.header("parameters", "count")),
+  );
+  for (const reader of [readIl2cppMetadata, readIl2cppMetadataForLinking]) {
+    const rejected = failure(unbacked, reader);
+    expect(rejected.reason).toBe("record-size-mismatch");
+    expect(rejected.message).toContain("section parameters");
+  }
+
+  const backed = createIl2cppMetadataFixture({
+    wide: { fillerTypes: 0, genericContainers: 0, parameters: count },
+  });
+  const decoded = readIl2cppMetadata(backed.bytes);
+  expect(decoded.index_widths.parameter).toBe(2);
+  expect(decoded.parameters).toHaveLength(count);
+  expect(decoded.methods).toHaveLength(FIXTURE_METHODS.length);
+});
+
+it.each(["interfaceOffsets", "typeDefinitions"] as const)(
+  "rejects %s as width evidence when its declared records have no bytes",
+  (name) => {
+    const bytes = mutated(
+      (fixture, bytes) => bytes.writeInt32LE(0, fixture.header(name, "size")),
+      createIl2cppMetadataFixture({
+        interfaceOffsets: name === "interfaceOffsets",
+      }),
+    );
+    for (const reader of [readIl2cppMetadata, readIl2cppMetadataForLinking]) {
+      const rejected = failure(bytes, reader);
+      expect(rejected.reason).toBe("record-size-mismatch");
+      expect(rejected.message).toContain(name);
+    }
+  },
+);
 
 describe("rejected IL2CPP metadata references", () => {
   it("rejects image, type, method and nested-type indices outside their tables", () => {
@@ -318,38 +501,42 @@ describe("rejected IL2CPP metadata references", () => {
     );
   });
 
-  it("rejects a shifted string section and names that start inside another string", () => {
-    // Pulled back, the fixture's strings would overlap the literal data.
-    for (const [delta, reason] of [
-      [-1, "section-overlap"],
-      [1, "invalid-string"],
-    ] as const)
-      rejects(
-        mutated((fixture, bytes) => {
-          const strings = fixture.section("strings");
-          bytes.writeInt32LE(
-            strings.offset + delta,
-            fixture.header("strings", "offset"),
-          );
-          // Shrink a forward shift so it stays clear of the next section.
-          bytes.writeInt32LE(
-            strings.size - Math.max(delta, 0),
-            fixture.header("strings", "size"),
-          );
-        }),
-        reason,
-      );
+  it("rejects a string section overlapping literal data", () => {
     rejects(
-      mutated((fixture, bytes) =>
+      mutated((fixture, bytes) => {
         bytes.writeInt32LE(
-          fixture.stringOffset("Update") +
-            1 -
-            fixture.section("strings").offset,
-          fixture.record("methods", 0),
-        ),
-      ),
-      "invalid-string",
+          fixture.section("strings").offset - 1,
+          fixture.header("strings", "offset"),
+        );
+      }),
+      "section-overlap",
     );
+  });
+
+  it("decodes a valid string suffix from its byte offset", () => {
+    const fixture = createIl2cppMetadataFixture({
+      typeNames: { 0: "xPlayer" },
+    });
+    const bytes = Buffer.from(fixture.bytes);
+    const originalOffset = fixture.record("typeDefinitions", 0);
+    bytes.writeInt32LE(bytes.readInt32LE(originalOffset) + 1, originalOffset);
+
+    expect(readIl2cppMetadata(bytes).types[0]?.name).toBe("Player");
+  });
+
+  it("accepts a UTF-8 code-point boundary suffix and rejects a split code point", () => {
+    const fixture = createIl2cppMetadataFixture({
+      typeNames: { 0: "xéclair" },
+    });
+    const nameOffset = fixture.record("typeDefinitions", 0);
+    const sourceOffset = fixture.bytes.readInt32LE(nameOffset);
+    const validSuffix = Buffer.from(fixture.bytes);
+    validSuffix.writeInt32LE(sourceOffset + 1, nameOffset);
+    expect(readIl2cppMetadata(validSuffix).types[0]?.name).toBe("éclair");
+
+    const splitCodePoint = Buffer.from(fixture.bytes);
+    splitCodePoint.writeInt32LE(sourceOffset + 2, nameOffset);
+    rejects(splitCodePoint, "invalid-string");
   });
 
   it("rejects nesting cycles and self-nesting", () => {
@@ -455,6 +642,7 @@ describe("IL2CPP global-metadata versions 29 and 31", () => {
     rejects(
       createIl2cppMetadataFixture({ version: 29 }).bytes.subarray(0, 200),
       "truncated-header",
+      "truncated",
     );
     rejects(
       mutated(
@@ -486,9 +674,7 @@ describe("IL2CPP global-metadata versions 29 and 31", () => {
       mutated(
         (target, bytes) =>
           bytes.writeInt32LE(
-            target.stringOffset("Update") +
-              1 -
-              target.section("strings").offset,
+            target.section("strings").size + 1,
             target.record("methods", 0),
           ),
         fixture,
@@ -702,5 +888,26 @@ describe("IL2CPP global-metadata version 24", () => {
       ),
       "unexpected-header-size",
     );
+  });
+});
+
+it("keeps unsigned legacy literal lengths distinct from signed counted offsets", () => {
+  const legacy = mutated(
+    (fixture, bytes) => {
+      bytes.writeUInt32LE(0xffffffff, fixture.section("stringLiterals").offset);
+    },
+    createIl2cppMetadataFixture({ version: 29 }),
+  );
+  expect(failure(legacy)).toMatchObject({
+    reason: "index-out-of-range",
+    message: expect.stringContaining("4294967295"),
+  });
+
+  const counted = mutated((fixture, bytes) => {
+    bytes.writeInt32LE(-1, fixture.section("stringLiterals").offset);
+  });
+  expect(failure(counted)).toMatchObject({
+    reason: "index-out-of-range",
+    message: expect.stringContaining("[-1,"),
   });
 });

@@ -2,19 +2,23 @@
 
 import contextlib
 import errno
+from html import unescape
 import importlib.util
 import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
+from textwrap import dedent
 from threading import Thread
 import unittest
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.parse import urljoin, urlsplit
+from urllib.request import build_opener, ProxyHandler, urlopen
 import xml.etree.ElementTree as ET
 
 import polib
@@ -35,6 +39,231 @@ def load_script(name):
 PREPARE = load_script("prepare-website")
 VERIFY = load_script("verify-website")
 WEBSITE = load_script("website")
+AUDIT = load_script("audit-website-links")
+
+
+class WebsiteLinkAuditChecks(unittest.TestCase):
+    """Check GitHub transport and URL classification without live network access."""
+
+    def test_github_json_is_decoded_as_utf8_under_a_legacy_locale(self):
+        # Exercise real subprocess pipe decoding with UTF-8 mode disabled. Only
+        # the external gh executable and the default locale are substituted.
+        program = dedent('''\
+            import importlib.util
+            import json
+            from pathlib import Path
+            import subprocess
+            import sys
+            from unittest.mock import patch
+
+            scripts = Path(sys.argv[1])
+            sys.path.insert(0, str(scripts))
+            spec = importlib.util.spec_from_file_location("audit", scripts / "audit-website-links.py")
+            audit = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(audit)
+            payload = json.dumps({"title": "Release \\u2603"}, ensure_ascii=False).encode("utf-8")
+            run = subprocess.run
+
+            def gh(command, **options):
+                assert command == ["gh", "api", "repos/example/project"]
+                return run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(" + repr(payload) + ")"], **options)
+
+            with patch("locale.getencoding", return_value="cp936"), patch.object(audit.subprocess, "run", side_effect=gh):
+                print(json.dumps(audit.github_api("repos/example/project")))
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8=0", "-c", program, str(ROOT / "scripts")],
+            capture_output=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"title": "Release \u2603"})
+
+    def test_raw_and_browser_links_resolve_the_same_ref_and_encoded_path(self):
+        # Prefix lookalikes must not win, and tags use the same ref/path split.
+        references = {
+            "repos/example/project/git/matching-refs/heads/topic": [
+                {"ref": "refs/heads/topic"},
+                {"ref": "refs/heads/topic/nested"},
+                {"ref": "refs/heads/topic/nestedness"},
+            ],
+            "repos/example/project/git/matching-refs/tags/topic": [
+                {"ref": "refs/tags/topic/nested/v1"},
+            ],
+            "repos/example/project/git/matching-refs/heads/topic%2Fnested": [
+                {"ref": "refs/heads/topic/nested"},
+                {"ref": "refs/heads/topic/nestedness"},
+            ],
+            "repos/example/project/git/matching-refs/tags/topic%2Fnested": [
+                {"ref": "refs/tags/topic/nested/v1"},
+            ],
+        }
+        cases = (
+            ("topic/nested/guide%20%23%3F.md", "guide%20%23%3F.md", "topic%2Fnested"),
+            ("topic/nested/v1/README.md", "README.md", "topic%2Fnested%2Fv1"),
+            ("topic%2Fnested/README.md", "README.md", "topic%2Fnested"),
+            ("refs/heads/topic/nested/v1/README.md", "v1/README.md", "refs%2Fheads%2Ftopic%2Fnested"),
+            ("refs/tags/topic/nested/v1/README.md", "README.md", "refs%2Ftags%2Ftopic%2Fnested%2Fv1"),
+        )
+        for suffix, path, ref in cases:
+            endpoint = f"repos/example/project/contents/{path}?ref={ref}"
+            responses = {**references, endpoint: {"name": "README.md"}}
+
+            def github_api(target):
+                if target not in responses:
+                    raise ValueError("gh: Not Found (HTTP 404)")
+                return responses[target]
+
+            for base in (
+                "https://raw.githubusercontent.com/example/project/",
+                "https://github.com/example/project/blob/",
+                "https://github.com/example/project/tree/",
+            ):
+                with self.subTest(url=base + suffix), patch.object(AUDIT, "github_api", side_effect=github_api):
+                    report = AUDIT.audit_url((base + suffix, ["fixture.html"]))
+                    self.assertEqual(report["status"], "ok")
+                    self.assertEqual(report["endpoint"], endpoint)
+
+    def test_repeated_link_checks_do_not_mutate_cached_github_refs(self):
+        heads = [{"ref": "refs/heads/topic"}]
+        tags = [{"ref": "refs/tags/topic/nested"}]
+        ref_endpoint = "repos/example/project/git/matching-refs/"
+        responses = {
+            ref_endpoint + "heads/topic": heads,
+            ref_endpoint + "tags/topic": tags,
+        }
+        with patch.object(AUDIT, "github_api", side_effect=responses.__getitem__):
+            for file in ("README.md", "guide.md", "examples/a.md"):
+                url = urlsplit(f"https://github.com/example/project/blob/topic/nested/{file}")
+                self.assertEqual(
+                    AUDIT.github_target(url).endpoint,
+                    f"repos/example/project/contents/{file}?ref=topic%2Fnested",
+                )
+        self.assertEqual(heads, [{"ref": "refs/heads/topic"}])
+        self.assertEqual(tags, [{"ref": "refs/tags/topic/nested"}])
+
+    def test_plain_refs_and_pinned_commits_keep_their_contents_target(self):
+        for ref in ("main", "a" * 40):
+            responses = {
+                "repos/example/project/git/matching-refs/heads/main": [{"ref": "refs/heads/main"}],
+                "repos/example/project/git/matching-refs/tags/main": [],
+                f"repos/example/project/contents/README.md?ref={ref}": {"name": "README.md"},
+            }
+            for base in ("https://raw.githubusercontent.com/example/project/", "https://github.com/example/project/blob/"):
+                with self.subTest(ref=ref, base=base), patch.object(AUDIT, "github_api", side_effect=responses.__getitem__):
+                    report = AUDIT.audit_url((base + ref + "/README.md", ["fixture.html"]))
+                    self.assertEqual(report["status"], "ok")
+                    self.assertEqual(report["endpoint"], f"repos/example/project/contents/README.md?ref={ref}")
+
+    def test_raw_github_urls_distinguish_repository_files_from_other_routes(self):
+        ref = "a" * 40
+        responses = {
+            f"repos/example/project/contents/scripts?ref={ref}": [{"name": "tool.py", "type": "file"}],
+            f"repos/example/project/contents/vendor/library?ref={ref}": {
+                "type": "file", "submodule_git_url": "https://github.com/example/library.git",
+            },
+            "repos/example/project/git/matching-refs/heads/releases": [{"ref": "refs/heads/releases"}],
+            "repos/example/project/git/matching-refs/tags/releases": [],
+            "repos/example/project/contents/download/packages/tool.zip?ref=releases": {"type": "file"},
+            "repos/example/project/releases/tags/v1": {"assets": [{"name": "tool.zip"}]},
+        }
+        cases = (
+            (f"https://raw.githubusercontent.com/example/project/{ref}/scripts", "broken"),
+            (f"https://github.com/example/project/tree/{ref}/scripts", "ok"),
+            (f"https://raw.githubusercontent.com/example/project/{ref}/vendor/library", "broken"),
+            (f"https://github.com/example/project/tree/{ref}/vendor/library", "ok"),
+            ("https://raw.githubusercontent.com/example/project/releases/download/packages/tool.zip", "ok"),
+            ("https://github.com/example/project/releases/download/v1/tool.zip", "ok"),
+            ("https://github.com/example/project/releases/download/v1/missing.zip", "broken"),
+            ("https://raw.githubusercontent.com/example/project", "broken"),
+        )
+        with patch.object(AUDIT, "github_api", side_effect=responses.__getitem__):
+            for url, expected in cases:
+                with self.subTest(url=url):
+                    self.assertEqual(AUDIT.audit_url((url, ["fixture.html"]))["status"], expected)
+
+    def test_malformed_external_links_do_not_hide_other_audit_results(self):
+        invalid = (
+            "https://[::1/guide",
+            "https://github.com:bad/example/project",
+            "https:///no-host",
+            "http://bad host.invalid/guide",
+            "http://example.invalid/not escaped",
+        )
+        valid = "https://github.com/example/project"
+        html = "website/public/index.html"
+        markdown = "website/guide.md"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page = root / html
+            page.parent.mkdir(parents=True)
+            page.write_text("".join(f'<a href="{url}">Link</a>' for url in (*invalid, valid, "https://rea.tools/")))
+            (root / markdown).write_text(f"[Guide]({invalid[0]})")
+            opener = build_opener(ProxyHandler({}))
+            with (
+                patch.object(AUDIT, "github_api", return_value={"name": "project"}) as probe,
+                patch.object(AUDIT, "urlopen", opener.open),
+            ):
+                reports = {
+                    report["url"]: report
+                    for item in AUDIT.external_links(root).items()
+                    if (report := AUDIT.audit_url(item)) is not None
+                }
+
+        probe.assert_called_once_with("repos/example/project")
+        self.assertEqual(set(reports), {*invalid, valid})
+        self.assertEqual(reports[valid]["status"], "ok")
+        for index, url in enumerate(invalid):
+            with self.subTest(url=url):
+                self.assertEqual(reports[url]["status"], "broken")
+                self.assertEqual(reports[url]["sources"], sorted([html, markdown] if index == 0 else [html]))
+                self.assertIn("Invalid URL", reports[url]["reason"])
+
+    def test_markdown_destinations_reach_both_link_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "website").mkdir()
+            (root / "docs").mkdir()
+            (root / "docs/releases(v1).md").write_text("# Release notes\n")
+            source = root / "website/guide.md"
+            source.write_text(dedent('''\
+                [Release](../docs/releases(v1).md#release-notes)
+                [Upstream][ref]
+                [Malformed](https:/missing-authority)
+                [IPv6](https://[::1/guide)
+                <https://example.invalid/docs(1)>
+                <img src="HTTPS://example.invalid/figure(1).png">
+
+                `[Code example](https://example.invalid/ignore-inline)`
+
+                ```md
+                [Code example](../missing.md)
+                [Code example](https://example.invalid/ignore-fenced)
+                ```
+
+                [ref]: HTTPS://example.invalid/release(v1)
+            '''))
+            self.assertCountEqual(AUDIT.external_links(root), [
+                "HTTPS://example.invalid/release(v1)", "https:/missing-authority",
+                "https://[::1/guide", "https://example.invalid/docs(1)",
+                "HTTPS://example.invalid/figure(1).png",
+            ])
+            errors = VERIFY.check_repository_links(root)
+            self.assertEqual(len(errors), 2)
+            for malformed in ("https:/missing-authority", "https://[::1/guide"):
+                self.assertTrue(any(f"website/guide.md: invalid URL '{malformed}'" in error for error in errors))
+
+    def test_missing_contents_and_unavailable_github_probes_remain_distinct(self):
+        cases = (
+            (ValueError("gh: Not Found (HTTP 404)"), "broken"),
+            (ValueError("gh: Forbidden (HTTP 403)"), "unknown"),
+            (subprocess.TimeoutExpired(["gh", "api"], 20), "unknown"),
+        )
+        for failure, status in cases:
+            for base in ("https://raw.githubusercontent.com/example/project/", "https://github.com/example/project/blob/"):
+                with self.subTest(failure=str(failure), base=base), patch.object(AUDIT, "github_api", side_effect=failure):
+                    report = AUDIT.audit_url((base + "a" * 40 + "/missing.md", ["fixture.html"]))
+                    self.assertEqual(report["status"], status)
+                    self.assertEqual(report["reason"], str(failure))
 
 
 class WebsiteSearchChecks(unittest.TestCase):
@@ -93,6 +322,12 @@ class WebsiteSearchChecks(unittest.TestCase):
                 "head canonical",
             ),
             (
+                "faq/index.html",
+                'hreflang="zh-CN" href="https://rea.tools/zh-CN/faq/"',
+                'hreflang="zh-CN" href="https://[::1/faq/"',
+                "invalid URL",
+            ),
+            (
                 "showcase/aegis/index.html",
                 'rel="canonical" href="https://rea.tools/showcase/aegis/"',
                 'rel="canonical" href="https://rea.tools/"',
@@ -140,6 +375,16 @@ class WebsiteSearchChecks(unittest.TestCase):
 
 class WebsiteMaintenanceChecks(unittest.TestCase):
     """Exercise contributor edits and the static preview through real consumers."""
+
+    def test_electron_guide_renderer_matches_download(self):
+        public = ROOT / "website/public"
+        source = (public / "guides/javascript/index.html").read_text(encoding="utf-8")
+        document = Document(source)
+        blocks = [node for node in document.nodes if node.attrs.get("id") == "notes-renderer-source"]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].tag, "code")
+        displayed = unescape(source[blocks[0].open_end:blocks[0].end_start]) + "\n"
+        self.assertEqual(displayed, (public / "examples/notes-electron/renderer.js").read_text(encoding="utf-8"))
 
     def test_contributors_render_from_snapshot_and_reject_drift_without_rewriting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,7 +552,7 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
                     page.write_text(original.replace("</main>", inserted + "</main>", 1))
                     self.assertTrue(any(message in error for error in VERIFY.check_site(site)[3]))
 
-    def test_repository_links_reject_missing_files_and_old_markdown_anchors(self):
+    def test_repository_links_preserve_targets_and_containment_through_aliased_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             container = Path(directory)
             root = container / "repository"
@@ -328,54 +573,12 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
                 "[File](../docs/removed.md)\n"
                 "[Escape](../../outside.md)\n"
             )
-            errors = VERIFY.check_repository_links(alias)
-            self.assertTrue(any("missing Markdown fragment" in error for error in errors))
-            self.assertTrue(any("missing repository target" in error for error in errors))
-            self.assertTrue(
-                any("missing repository target: ../../outside.md" in error for error in errors)
-            )
-
-    def test_site_links_accept_directory_aliases_and_still_reject_escape(self):
-        with tempfile.TemporaryDirectory() as directory:
-            site = Path(directory) / "public"
-            shutil.copytree(ROOT / "website/_site", site)
-            canonical_site = site.resolve()
-            alias = Path(directory) / "public-alias"
-            alias.symlink_to(canonical_site, target_is_directory=True)
-            self.assertEqual(VERIFY.check_site(canonical_site)[3], [])
-            self.assertEqual(VERIFY.check_site(alias)[3], [])
-
-            page = canonical_site / "faq/index.html"
-            page.write_text(
-                page.read_text().replace(
-                    "</main>",
-                    '<a href="https://rea.tools/../../outside/">Escape</a></main>',
-                    1,
-                )
-            )
-            errors = VERIFY.check_site(alias)[3]
-            self.assertTrue(
-                any("reference leaves the website" in error for error in errors)
-            )
-
-    def test_repository_links_accept_aliased_roots_and_reject_escaping_links(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = (Path(directory) / "repository").resolve()
-            (root / "website/public").mkdir(parents=True)
-            (root / "docs").mkdir()
-            (root / "docs/guide.md").write_text("# Guide\n")
-            page = root / "website/README.md"
-            page.write_text("[Guide](../docs/guide.md#guide)\n")
-            alias = Path(directory) / "repository-alias"
-            alias.symlink_to(root, target_is_directory=True)
-            self.assertEqual(VERIFY.check_repository_links(root), [])
-            self.assertEqual(VERIFY.check_repository_links(alias), [])
-            (root.parent / "outside.md").write_text("# Outside\n")
-            page.write_text("[Outside](../../outside.md)\n")
             for boundary in (root, alias):
                 with self.subTest(boundary=boundary):
-                    self.assertEqual(VERIFY.check_repository_links(boundary), [
-                        "website/README.md: missing repository target: ../../outside.md"
+                    self.assertCountEqual(VERIFY.check_repository_links(boundary), [
+                        "website/README.md: missing Markdown fragment: ../docs/guide.md#removed",
+                        "website/README.md: missing repository target: ../docs/removed.md",
+                        "website/README.md: missing repository target: ../../outside.md",
                     ])
 
     def test_site_links_preserve_containment_through_aliased_roots(self):
@@ -394,10 +597,12 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
             self.assertEqual(VERIFY.check_site(site)[3], expected)
             self.assertEqual(VERIFY.check_site(alias)[3], expected)
             (site.parent / "outside.html").write_text("<p>Outside</p>")
-            page.write_text(page.read_text().replace("guide.html#answer", "../outside.html"))
-            for boundary in (site, alias):
-                with self.subTest(boundary=boundary):
-                    self.assertIn("index.html: reference leaves the website: ../outside.html", VERIFY.check_site(boundary)[3])
+            content = page.read_text()
+            for reference in ("../outside.html", "https://rea.tools/../outside.html"):
+                page.write_text(content.replace("guide.html#answer", reference))
+                for boundary in (site, alias):
+                    with self.subTest(boundary=boundary, reference=reference):
+                        self.assertIn(f"index.html: reference leaves the website: {reference}", VERIFY.check_site(boundary)[3])
 
     def test_preview_preserves_pages_prefix_for_assets_and_directory_redirects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -405,6 +610,9 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
             (site / "guide").mkdir()
             (site / "guide/index.html").write_text("<h1>Guide</h1>")
             (site / "asset.css").write_text("body { color: black; }")
+            comment = b"\xff\x80\r\n"
+            archive = bytes.fromhex("504b0506" + "00" * 16) + len(comment).to_bytes(2, "little") + comment
+            (site / "download.zip").write_bytes(archive)
             for prefix in ("/", "/rea/"):
                 with self.subTest(prefix=prefix), ThreadingHTTPServer(("127.0.0.1", 0), WEBSITE.preview_handler(site, prefix)) as server:
                     worker = Thread(target=server.serve_forever, daemon=True)
@@ -416,13 +624,17 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
                             self.assertEqual(response.read(), b"<h1>Guide</h1>")
                         with urlopen(base + prefix + "asset.css") as response:
                             self.assertIn(b"color: black", response.read())
+                        with urlopen(base + prefix + "download.zip") as response:
+                            self.assertEqual(response.read(), archive)
                         with self.assertRaises(HTTPError) as error:
                             urlopen(base + prefix + "missing")
-                        self.assertEqual(error.exception.code, 404)
+                        with contextlib.closing(error.exception) as response:
+                            self.assertEqual(response.code, 404)
                         if prefix != "/":
                             with self.assertRaises(HTTPError) as error:
                                 urlopen(base + "/guide/")
-                            self.assertEqual(error.exception.code, 404)
+                            with contextlib.closing(error.exception) as response:
+                                self.assertEqual(response.code, 404)
                     finally:
                         server.shutdown()
                         worker.join()
@@ -430,6 +642,126 @@ class WebsiteMaintenanceChecks(unittest.TestCase):
 
 class WebsiteTranslationChecks(unittest.TestCase):
     """Exercise source edits, translated evidence and language editions at their consumers."""
+
+    def test_translation_keeps_malformed_references_for_the_verifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(ROOT / "website/templates", root / "website/templates")
+            locales = root / "website/locales"
+            locales.mkdir()
+            inventory = [item for item in languages(ROOT) if item["code"] in {"en", "zh-CN", "ar"}]
+            (locales / "languages.json").write_text(json.dumps(inventory))
+            page = WEBSITE.new_page(root, "guide", "Fixture", "Fixture guide.")
+            bad_links = ("https://[::1/guide", "https://[::1/figure", "https://[::1/script")
+            source = page.read_text().replace('    <meta name="robots" content="noindex" />\n', "")
+            source = source.replace("</main>", f'<a href="{bad_links[0]}">Broken</a><img src="{bad_links[1]}" alt=""></main>')
+            page.write_text(source.replace("</body>", f'<script src="{bad_links[2]}"></script></body>'))
+            WEBSITE.sync_pages(root)
+            extract_catalogs(root)
+            catalog_path = locales / "zh-CN/messages.po"
+            catalog = polib.pofile(catalog_path)
+            for entry in catalog:
+                entry.msgstr = entry.msgid
+            catalog.save(catalog_path)
+
+            output = root / "website/_site"
+            build_translations(root, output)
+            diagnostics = VERIFY.check_site(output)[3]
+            for published in ("guide/index.html", "zh-CN/guide/index.html", "ar/guide/index.html"):
+                for link in bad_links:
+                    with self.subTest(published=published, link=link):
+                        self.assertTrue(any(f"{published}: invalid URL '{link}'" in error for error in diagnostics))
+
+    def test_language_switcher_preserves_encoded_paths_under_both_site_prefixes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(ROOT / "website/templates", root / "website/templates")
+            locales = root / "website/locales"
+            locales.mkdir()
+            shutil.copyfile(ROOT / "website/locales/languages.json", locales / "languages.json")
+            route = "guides/Notes #1?%23 café"
+            path = WEBSITE.new_page(root, route, "Fixture", "Fixture guide.")
+            path.write_text(path.read_text().replace('    <meta name="robots" content="noindex" />\n', ""))
+            WEBSITE.sync_pages(root)
+
+            nodes = Document(path.read_text()).nodes
+            canonical, = [node.attrs["href"] for node in nodes if node.attrs.get("rel") == "canonical"]
+            picker = next(node for node in nodes if node.attrs.get("data-language") == "zh-CN")
+            alternate = next(node for node in nodes if node.attrs.get("hreflang") == "zh-CN")
+            encoded = "guides/Notes%20%231%3F%2523%20caf%C3%A9/"
+            self.assertEqual(canonical, "https://rea.tools/" + encoded)
+            self.assertEqual(alternate.attrs["href"], "https://rea.tools/zh-CN/" + encoded)
+            for prefix in ("/", "/rea/"):
+                with self.subTest(prefix=prefix):
+                    base = "https://example.com" + prefix
+                    self.assertEqual(urljoin(base + encoded, picker.attrs["href"]), base + "zh-CN/" + encoded)
+
+    def test_language_inventory_preserves_script_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "website/locales").mkdir(parents=True)
+            for code in ("ur", "ur-PK", "ur-Latn", "ur-Latn-PK", "hi-Latn"):
+                inventory = [
+                    {"code": "en", "name": "English", "readme": "README.md", "dir": "ltr"},
+                    {"code": code, "name": "Fixture", "readme": f"docs/readme/README_{code}.md", "dir": "ltr"},
+                ]
+                path = root / "website/locales/languages.json"
+                path.write_text(json.dumps(inventory))
+                with self.subTest(code=code):
+                    self.assertEqual(languages(root), inventory)
+            for code in ("ur-latn", "ur-LATN", "ur-PK-Latn", "ur/Latn"):
+                inventory[1]["code"] = code
+                path.write_text(json.dumps(inventory))
+                with self.subTest(code=code), self.assertRaisesRegex(ValueError, "Invalid or duplicate language"):
+                    languages(root)
+
+    def test_completed_script_tag_pages_pass_search_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # check_site canonicalizes its root before collecting page keys.
+            site = Path(directory).resolve()
+            (site / "assets").mkdir()
+            shutil.copyfile(ROOT / "website/_site/assets/social-card.png", site / "assets/social-card.png")
+            shutil.copyfile(ROOT / "website/public/robots.txt", site / "robots.txt")
+            pages = {}
+            for code in ("ur-Latn", "ur-Latn-PK"):
+                path = site / code / "index.html"
+                path.parent.mkdir()
+                url = f"https://rea.tools/{code}/"
+                source = dedent(f'''\
+                    <!doctype html>
+                    <html lang="{code}" dir="ltr">
+                    <head>
+                      <title>REA ka ta'aruf</title>
+                      <meta name="description" content="REA ko samjhein." />
+                      <link rel="canonical" href="{url}" />
+                      <link rel="alternate" hreflang="{code}" href="{url}" />
+                      <meta property="og:type" content="website" />
+                      <meta property="og:site_name" content="REA" />
+                      <meta property="og:title" content="REA ka ta'aruf" />
+                      <meta property="og:description" content="REA ko samjhein." />
+                      <meta property="og:url" content="{url}" />
+                      <meta property="og:image" content="https://rea.tools/assets/social-card.png" />
+                      <meta property="og:image:type" content="image/png" />
+                      <meta property="og:image:width" content="1200" />
+                      <meta property="og:image:height" content="630" />
+                      <meta property="og:image:alt" content="REA" />
+                      <meta name="twitter:card" content="summary_large_image" />
+                      <meta name="twitter:title" content="REA ka ta'aruf" />
+                      <meta name="twitter:description" content="REA ko samjhein." />
+                      <meta name="twitter:image" content="https://rea.tools/assets/social-card.png" />
+                      <meta name="twitter:image:alt" content="REA" />
+                    </head>
+                    <body><h1>REA ka ta'aruf</h1></body>
+                    </html>
+                ''')
+                path.write_text(source, encoding="utf-8")
+                page = VERIFY.HtmlReferences()
+                page.feed(source)
+                self.assertFalse(page.translation_fallback)
+                self.assertFalse(page.noindex())
+                pages[path] = page
+            PREPARE.prepare_sitemap(site)
+            self.assertEqual(VERIFY.check_search_metadata(site, pages), (2, []))
 
     @contextlib.contextmanager
     def translated_project(self):
@@ -584,21 +916,11 @@ class WebsiteTranslationChecks(unittest.TestCase):
                     self.assertTrue(set(parser.copy_targets) <= parser.ids)
         for fixture in WEBSITE.NOTES_FIXTURES:
             self.assertEqual((site / fixture).read_bytes(), (ROOT / "website/public" / fixture).read_bytes())
-        with ThreadingHTTPServer(("127.0.0.1", 0), WEBSITE.preview_handler(site, "/rea/")) as server:
-            worker = Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            try:
-                base = f"http://127.0.0.1:{server.server_port}/rea/"
-                with urlopen(base + "ar/faq?test=1") as response:
-                    self.assertEqual(response.url, base + "ar/faq/?test=1")
-                    self.assertIn(b'lang="ar"', response.read())
-                with urlopen(base + "assets/i18n.js") as response:
-                    self.assertIn(b"export function t", response.read())
-                with urlopen(base + "examples/notes-example.zip") as response:
-                    self.assertEqual(response.read(), (site / "examples/notes-example.zip").read_bytes())
-            finally:
-                server.shutdown()
-                worker.join()
+        runtime = "assets/i18n.js"
+        self.assertEqual((site / runtime).read_bytes(), (ROOT / "website/public" / runtime).read_bytes())
+        arabic = VERIFY.HtmlReferences()
+        arabic.feed((site / "ar/faq/index.html").read_text())
+        self.assertEqual(arabic.lang, "ar")
 
     def test_every_reading_page_loads_theme_before_styles(self):
         site = ROOT / "website/_site"

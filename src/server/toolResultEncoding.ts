@@ -3,7 +3,11 @@ import { constants as bufferConstants } from "node:buffer";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { bufferedJsonParts, jsonParts } from "../domain/jsonSerialization.js";
 
-export const MCP_RESULT_STRING_LIMIT = bufferConstants.MAX_STRING_LENGTH - 1024;
+/** Node's actual single-string ceiling. REA refuses earlier, at MCP_RESULT_STRING_LIMIT. */
+export const NODE_MAX_STRING_LENGTH = bufferConstants.MAX_STRING_LENGTH;
+
+/** REA's reserved serialization limit, 1024 code units under Node's ceiling. */
+export const MCP_RESULT_STRING_LIMIT = NODE_MAX_STRING_LENGTH - 1024;
 
 const RESULT_ENVELOPE_BYTES =
   Buffer.byteLength(
@@ -120,4 +124,18 @@ export const encodeToolResult = (
     parts.push(part);
   }
   return { ok: true, text: parts.join(""), bytes };
+};
+
+/**
+ * A value's wire size inside an error result's text, measured exactly as the
+ * encoder counts it (escaped UTF-8), stopping once it exceeds the budget. A
+ * value over the budget cannot be delivered alone, so its clipped size still
+ * ranks it above every value that fits.
+ */
+export const errorTextWireBytes = (
+  value: JsonValue,
+  budgetBytes: number,
+): number => {
+  const encoded = encodeToolResult(value, budgetBytes, "error-text");
+  return encoded.ok ? encoded.bytes : encoded.bytesAtLeast;
 };
