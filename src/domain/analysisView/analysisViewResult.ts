@@ -191,6 +191,7 @@ import {
 } from "./webNetworkCaptureView.js";
 
 import {
+  androidClassPageViewResultSchema,
   androidClassSummaryViewResultSchema,
   androidComponentSummaryViewResultSchema,
   androidComponentsViewResultSchema,
@@ -199,6 +200,8 @@ import {
   androidManifestViewResultSchema,
   androidMethodSummaryViewResultSchema,
   androidPackageSummaryViewResultSchema,
+  androidReferencesPageViewResultSchema,
+  androidReferencesSummaryViewResultSchema,
 } from "./summarySchemas/androidSummarySchemas.js";
 import {
   apiContractPageViewResultSchema,
@@ -273,6 +276,7 @@ import { nativeProcedureReferencesSummaryViewResultSchema } from "./summarySchem
 import { nativeValueTraceSummaryViewResultSchema } from "./summarySchemas/nativeValueTraceSummarySchema.js";
 import { nugetNupkgSummaryViewResultSchema } from "./summarySchemas/nugetNupkgSummarySchema.js";
 import { objdumpSummaryViewResultSchema } from "./summarySchemas/objdumpSummarySchema.js";
+import { ociImageLayoutSummaryViewResultSchema } from "./summarySchemas/ociImageLayoutSummarySchema.js";
 import { pcapCaptureSummaryViewResultSchema } from "./summarySchemas/pcapCaptureSummarySchema.js";
 import {
   playwrightTracePageViewResultSchema,
@@ -304,6 +308,14 @@ import {
   webExecutionPageViewResultSchema,
   webExecutionSummaryViewResultSchema,
 } from "./summarySchemas/webExecutionSummarySchemas.js";
+import {
+  apktoolResourcesPageViewResultSchema,
+  apktoolResourcesSummaryViewResultSchema,
+} from "./summarySchemas/apktoolResourcesSummarySchemas.js";
+import {
+  artifactExtractionPageViewResultSchema,
+  artifactExtractionSummaryViewResultSchema,
+} from "./summarySchemas/artifactExtractionSummarySchemas.js";
 import { webNetworkCaptureSummaryViewResultSchema } from "./summarySchemas/webNetworkCaptureSummarySchema.js";
 import {
   webSourceLocationMatchesViewResultSchema,
@@ -312,6 +324,7 @@ import {
 } from "./summarySchemas/webSourceLocationSummarySchemas.js";
 
 export {
+  androidClassPageViewResultSchema,
   androidClassSummaryViewResultSchema,
   androidComponentSummaryViewResultSchema,
   androidComponentsViewResultSchema,
@@ -320,6 +333,8 @@ export {
   androidManifestViewResultSchema,
   androidMethodSummaryViewResultSchema,
   androidPackageSummaryViewResultSchema,
+  androidReferencesPageViewResultSchema,
+  androidReferencesSummaryViewResultSchema,
   apiContractPageViewResultSchema,
   apiContractSummaryViewResultSchema,
   apkSignaturePageViewResultSchema,
@@ -367,6 +382,7 @@ export {
   nativeValueTraceSummaryViewResultSchema,
   nugetNupkgSummaryViewResultSchema,
   objdumpSummaryViewResultSchema,
+  ociImageLayoutSummaryViewResultSchema,
   pcapCaptureSummaryViewResultSchema,
   playwrightTracePageViewResultSchema,
   playwrightTraceSummaryViewResultSchema,
@@ -388,6 +404,10 @@ export {
   webPageSummaryViewResultSchema,
   webExecutionPageViewResultSchema,
   webExecutionSummaryViewResultSchema,
+  apktoolResourcesPageViewResultSchema,
+  apktoolResourcesSummaryViewResultSchema,
+  artifactExtractionPageViewResultSchema,
+  artifactExtractionSummaryViewResultSchema,
   webNetworkCaptureSummaryViewResultSchema,
   webSourceLocationMatchesViewResultSchema,
   webSourceLocationSummaryViewResultSchema,
@@ -400,6 +420,7 @@ const viewResultBase = {
     "trace_web_source_location",
     "inspect_python_pyc",
     "inspect_nuget_nupkg",
+    "inspect_oci_image_layout",
     "inspect_erlang_beam",
     "inspect_devicetree",
     "inspect_byte_entropy",
@@ -697,6 +718,8 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
   webBundlePageViewResultSchema,
   webPagePageViewResultSchema,
   webExecutionPageViewResultSchema,
+  apktoolResourcesPageViewResultSchema,
+  artifactExtractionPageViewResultSchema,
   sourceToBundlePageViewResultSchema,
   endpointComparisonPageViewResultSchema,
   apiContractPageViewResultSchema,
@@ -809,7 +832,11 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     webBundleSummaryViewResultSchema,
     webPageSummaryViewResultSchema,
     webExecutionSummaryViewResultSchema,
+    apktoolResourcesSummaryViewResultSchema,
+    androidReferencesSummaryViewResultSchema,
+    artifactExtractionSummaryViewResultSchema,
     nugetNupkgSummaryViewResultSchema,
+    ociImageLayoutSummaryViewResultSchema,
   ]),
   z.strictObject({
     ...viewResultBase,
@@ -993,6 +1020,8 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
   }),
   androidPackageViewResultSchema,
   androidJniPageViewResultSchema,
+  androidReferencesPageViewResultSchema,
+  androidClassPageViewResultSchema,
   z.strictObject({
     kind: z.literal("dart-aot"),
     view: dartAotViewRequestSchema,
