@@ -2116,7 +2116,7 @@ when both are omitted, storage is not compared.
 
 `compare_artifacts` also compares the declarations in the `format_metadata` of <!-- BEGIN:compare-artifacts:compared-format-metadata-kinds -->UnityFS members (`unityfs-entry`), PyInstaller entries
 (`pyinstaller-entry`), Node SEA members (`node-sea-entry`),
-ESP image segments (`esp-image-segment`), DfuSe elements (`dfuse-element`),
+UBI volumes (`ubi-volume`), ESP image segments (`esp-image-segment`), DfuSe elements (`dfuse-element`),
 ESP flash partitions (`esp-flash-partition`), Nintendo DS ROM members
 (`nds-entry`), FIT images (`fit-image`) and tar
 members (`tar-entry`)<!-- END:compare-artifacts:compared-format-metadata-kinds -->;
@@ -2389,6 +2389,9 @@ annotations, handlers and client approval rules. Loading does not execute an
 analysis, open a target, or initialize the deferred analysis runtime. A batch
 emits one list-change notification; repeating it emits none. Loaded tools remain
 available until the connection ends. There is no generic execution gateway.
+Calling an in-scope tool before it is loaded returns a JSON-RPC `-32602` error
+that names the `discover_tools` call with that exact name; a tool excluded from
+the server keeps the SDK's `disabled` refusal.
 If a loaded tool does not appear in the client, enable client catalog refresh
 or reconnect using `REA_MCP_TOOL_CATALOG_PROFILE=full`.
 
